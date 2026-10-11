@@ -103,8 +103,9 @@ async function schedule(member){
   if(member.user.bot || member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) return;
   if (!storageReady) {console.warn(`[Safeguard] Join ${member.id} not registered: storage unavailable`); return;}
   await recordNewJoin(member);
-  const ch=await bot.channels.fetch(cfg.VERIFY_CHANNEL_ID).catch(()=>null);
-  if(ch?.isTextBased()) await ch.send({content:`<@${member.id}> Please verify to access the server. There is no automatic verification timeout kick.`,components:[button()],allowedMentions:{users:[member.id]}}).catch(e=>console.error('Verification message failed:',e.message));
+  // No per-member verification message or ping. The pinned /verifypanel
+  // embed is the only verification entry point.
+  console.log(`[Safeguard] Registered new member ${member.id} for silent verification.`);
 }
 // Timeouts NEVER kick. This intentionally disables historical and new-member
 // timeout removals; moderators can review pending members manually.
