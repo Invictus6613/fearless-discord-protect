@@ -25,6 +25,7 @@ async function pendingSet(id,when=Date.now()) {await pool.query('INSERT INTO saf
 async function pendingRemove(id){await pool.query('DELETE FROM safeguard_pending WHERE user_id=$1',[id]);}
 async function pendingAll(){const r=await pool.query('SELECT user_id,joined_at FROM safeguard_pending');return r.rows;}
 const bot = new Client({intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]});
+const states = new Map();
 const app = express();
 let storageReady = false;
 app.disable('x-powered-by');
