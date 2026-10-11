@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
+import pg from 'pg';
 import { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, EmbedBuilder } from 'discord.js';
 
 const required = ['DISCORD_TOKEN','CLIENT_ID','CLIENT_SECRET','GUILD_ID','VERIFIED_ROLE_ID','VERIFY_CHANNEL_ID','PUBLIC_URL'];
@@ -9,20 +9,24 @@ for (const key of required) if (!process.env[key]) throw new Error(`Missing ${ke
 const cfg = process.env;
 const base = cfg.PUBLIC_URL.replace(/\/$/,'');
 const timeout = Math.max(1, Number(cfg.VERIFY_TIMEOUT_MINUTES || 15)) * 60000;
-const file = new URL('./data.json', import.meta.url);
-let db = { blocked: [], pending: {} };
-if (fs.existsSync(file)) db = { ...db, ...JSON.parse(fs.readFileSync(file,'utf8')) };
-const save = () => {
-  try { fs.writeFileSync(file, JSON.stringify(db,null,2)); }
-  catch (e) { console.error('[Safeguard] Could not save local data:', e.message); }
-};
-const envBlocked = (cfg.BLOCKED_SERVER_IDS || '').split(/[\\s,;]+/).filter(id=>/^\\d{17,22}$/.test(id));
-db.blocked = [...new Set([...db.blocked, ...envBlocked])];
-console.log(`[Safeguard] Loaded ${db.blocked.length} restricted server IDs (${envBlocked.length} from environment).`);
-
-const states = new Map();
+if (!cfg.DATABASE_URL) throw new Error('Missing DATABASE_URL. Configure a persistent PostgreSQL database on Render before starting the bot.');
+const pool = new pg.Pool({connectionString:cfg.DATABASE_URL,ssl:cfg.DATABASE_SSL==='true'?{rejectUnauthorized:false}:undefined});
+const envBlocked = [...new Set((cfg.BLOCKED_SERVER_IDS||'').split(/[\s,;]+/).filter(x=>/^\d{17,22}$/.test(x)))];
+async function initializeStorage(){
+  await pool.query('CREATE TABLE IF NOT EXISTS safeguard_blocked_servers (guild_id TEXT PRIMARY KEY, added_at TIMESTAMPTZ NOT NULL DEFAULT NOW())');
+  await pool.query('CREATE TABLE IF NOT EXISTS safeguard_pending (user_id TEXT PRIMARY KEY, joined_at BIGINT NOT NULL)');
+  // Import environment defaults without deleting any servers added through slash commands.
+  for(const id of envBlocked) await pool.query('INSERT INTO safeguard_blocked_servers(guild_id) VALUES($1) ON CONFLICT DO NOTHING',[id]);
+  console.log(`[Safeguard] PostgreSQL ready; ${await blockedCount()} restricted servers (${envBlocked.length} environment defaults).`);
+}
+async function blockedCount(){const r=await pool.query('SELECT COUNT(*)::int AS n FROM safeguard_blocked_servers');return r.rows[0].n;}
+async function blockedIds(){const r=await pool.query('SELECT guild_id FROM safeguard_blocked_servers ORDER BY guild_id');return r.rows.map(x=>x.guild_id);}
+async function pendingSet(id,when=Date.now()) {await pool.query('INSERT INTO safeguard_pending(user_id,joined_at) VALUES($1,$2) ON CONFLICT DO NOTHING',[id,when]);}
+async function pendingRemove(id){await pool.query('DELETE FROM safeguard_pending WHERE user_id=$1',[id]);}
+async function pendingAll(){const r=await pool.query('SELECT user_id,joined_at FROM safeguard_pending');return r.rows;}
 const bot = new Client({intents:[GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]});
 const app = express();
+let storageReady = false;
 app.disable('x-powered-by');
 function button(){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Verify with Discord').setStyle(ButtonStyle.Link).setURL(`${base}/verify`)); }
 async function logEvent({title, color=0x64748b, member, reason, blockedIds=[], outcome, error}) {
@@ -46,14 +50,13 @@ async function logEvent({title, color=0x64748b, member, reason, blockedIds=[], o
 }
 async function log(message){ await logEvent({title:'Safeguard Notice',reason:message}); }
 async function kick(member, reason, blockedIds=[]) {
-  if (!member.kickable) { console.error(`[Safeguard] Cannot kick ${member.id}: permissions or role hierarchy`);
+  if (!member.kickable) {
     await logEvent({title:'Kick Failed',color:0xf59e0b,member,reason,blockedIds,outcome:'Member was not kicked',error:'Missing Kick Members permission or bot role is too low'});
     return false;
   }
   try {
     await member.kick(reason);
-    delete db.pending[member.id];
-    save();
+    await pendingRemove(member.id);
     await logEvent({title:'Member Kicked',color:0xef4444,member,reason,blockedIds,outcome:'Successfully kicked'});
     return true;
   } catch(e) {
@@ -62,13 +65,54 @@ async function kick(member, reason, blockedIds=[]) {
     return false;
   }
 }
-async function schedule(member){ if(member.user.bot || member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) return; db.pending[member.id] ??= Date.now(); save(); const ch=await bot.channels.fetch(cfg.VERIFY_CHANNEL_ID).catch(()=>null); if(ch?.isTextBased()) await ch.send({content:`<@${member.id}> Please verify within ${Math.round(timeout/60000)} minutes to remain in the server.`,components:[button()],allowedMentions:{users:[member.id]}}).catch(()=>{}); }
-async function sweep(){const guild=await bot.guilds.fetch(cfg.GUILD_ID).catch(()=>null);if(!guild)return;for(const [id,start] of Object.entries(db.pending)){if(Date.now()-start<timeout)continue;const m=await guild.members.fetch(id).catch(()=>null);if(m && !m.roles.cache.has(cfg.VERIFIED_ROLE_ID))await kick(m,'Verification timed out');else {delete db.pending[id];save();}}}
-const commands=[new SlashCommandBuilder().setName('blockserver').setDescription('Manage blocked Discord server IDs').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('add').setDescription('Block a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('remove').setDescription('Unblock a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('list').setDescription('List blocked IDs')),new SlashCommandBuilder().setName('safeguardstatus').setDescription('Check bot permissions and restricted servers').setDefaultMemberPermissions(PermissionFlagsBits.Administrator),new SlashCommandBuilder().setName('verifypanel').setDescription('Post verification button').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)];
-bot.once(Events.ClientReady,async()=>{await bot.application.commands.set(commands.map(c=>c.toJSON()),cfg.GUILD_ID); console.log(`Logged in as ${bot.user.tag}`);const guild=await bot.guilds.fetch(cfg.GUILD_ID);await guild.members.fetch();for(const member of guild.members.cache.values())if(!member.user.bot&&!member.roles.cache.has(cfg.VERIFIED_ROLE_ID)&&!db.pending[member.id])db.pending[member.id]=Date.now();save();setInterval(()=>sweep().catch(console.error),30000);});
+async function schedule(member){
+  if(member.user.bot || member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) return;
+  await pendingSet(member.id);
+  const ch=await bot.channels.fetch(cfg.VERIFY_CHANNEL_ID).catch(()=>null);
+  if(ch?.isTextBased()) await ch.send({content:`<@${member.id}> Please verify within ${Math.round(timeout/60000)} minutes to remain in the server.`,components:[button()],allowedMentions:{users:[member.id]}}).catch(e=>console.error('Verification message failed:',e.message));
+}
+async function sweep(){
+  const guild=await bot.guilds.fetch(cfg.GUILD_ID).catch(()=>null);
+  if(!guild)return;
+  for(const {user_id:id,joined_at:start} of await pendingAll()){
+    if(Date.now()-Number(start)<timeout)continue;
+    const m=await guild.members.fetch(id).catch(()=>null);
+    if(m && !m.roles.cache.has(cfg.VERIFIED_ROLE_ID)) await kick(m,'Verification timed out');
+    else await pendingRemove(id);
+  }
+}
+const commands=[new SlashCommandBuilder().setName('blockserver').setDescription('Manage blocked Discord server IDs').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('add').setDescription('Block a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('remove').setDescription('Unblock a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('list').setDescription('List blocked IDs')),new SlashCommandBuilder().setName('verifypanel').setDescription('Post verification button').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)];
+bot.once(Events.ClientReady,async()=>{
+  try {
+    await initializeStorage();
+    storageReady = true;
+    await bot.application.commands.set(commands.map(c=>c.toJSON()),cfg.GUILD_ID);
+    console.log(`Logged in as ${bot.user.tag}`);
+    const guild=await bot.guilds.fetch(cfg.GUILD_ID);
+    await guild.members.fetch();
+    for(const member of guild.members.cache.values()) if(!member.user.bot&&!member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) await pendingSet(member.id);
+    await sweep();
+    setInterval(()=>sweep().catch(e=>console.error('[Safeguard] Sweep failed:',e)),30000);
+  } catch(e){console.error('[Safeguard] Startup failed:',e);process.exitCode=1;await bot.destroy();await pool.end();}
+});
 bot.on(Events.GuildMemberAdd,member=>{if(member.guild.id===cfg.GUILD_ID)schedule(member).catch(console.error)});
-bot.on(Events.GuildMemberRemove,member=>{delete db.pending[member.id];save()});
-bot.on(Events.InteractionCreate,async i=>{if(!i.isChatInputCommand()||i.guildId!==cfg.GUILD_ID)return;if(!i.memberPermissions?.has(PermissionFlagsBits.Administrator))return i.reply({content:'Administrator only.',ephemeral:true});if(i.commandName==='safeguardstatus'){const guild=await bot.guilds.fetch(cfg.GUILD_ID);const self=await guild.members.fetchMe();const canKick=self.permissions.has(PermissionFlagsBits.KickMembers);return i.reply({content:`**Fearless Safeguard diagnostics**\\nRestricted server IDs: **${db.blocked.length}**\\nKick Members permission: **${canKick?'YES':'NO'}**\\nBot highest role: **${self.roles.highest.name}**\\nBot role position: **${self.roles.highest.position}**\\nLog channel configured: **${cfg.LOG_CHANNEL_ID?'YES':'NO'}**\\nNote: individual members with equal/higher roles or Administrator privileges cannot be kicked.`,ephemeral:true});}if(i.commandName==='verifypanel')return i.reply({content:'Click below to verify your Discord account and server memberships.',components:[button()]});const action=i.options.getSubcommand();const id=i.options.getString('id');if(action==='list')return i.reply({content:db.blocked.length?db.blocked.join('\n'):'No blocked servers.',ephemeral:true});if(!/^\d{17,22}$/.test(id))return i.reply({content:'Enter a valid numeric Discord server ID.',ephemeral:true});if(action==='add')db.blocked=[...new Set([...db.blocked,id])];else db.blocked=db.blocked.filter(x=>x!==id);save();await i.reply({content:`${action==='add'?'Blocked':'Unblocked'} server ${id}.`,ephemeral:true});});
+bot.on(Events.GuildMemberRemove,member=>{pendingRemove(member.id).catch(console.error)});
+bot.on(Events.InteractionCreate,async i=>{
+  if(!i.isChatInputCommand()||i.guildId!==cfg.GUILD_ID)return;
+  if(!i.memberPermissions?.has(PermissionFlagsBits.Administrator))return i.reply({content:'Administrator only.',ephemeral:true});
+  if(i.commandName==='verifypanel')return i.reply({content:'Click below to verify your Discord account and server memberships.',components:[button()]});
+  try {
+    const action=i.options.getSubcommand();const id=i.options.getString('id');
+    if(action==='list'){
+      const ids=await blockedIds();
+      return i.reply({content:ids.length?ids.join('\n').slice(0,1900):'No blocked servers.',ephemeral:true});
+    }
+    if(!/^\d{17,22}$/.test(id))return i.reply({content:'Enter a valid numeric Discord server ID.',ephemeral:true});
+    if(action==='add')await pool.query('INSERT INTO safeguard_blocked_servers(guild_id) VALUES($1) ON CONFLICT DO NOTHING',[id]);
+    else await pool.query('DELETE FROM safeguard_blocked_servers WHERE guild_id=$1',[id]);
+    await i.reply({content:`${action==='add'?'Blocked':'Unblocked'} server ${id}. Stored permanently in PostgreSQL.`,ephemeral:true});
+  }catch(e){console.error('[Safeguard] Command error:',e);if(!i.replied)await i.reply({content:'Database unavailable. No change was confirmed; please try again.',ephemeral:true}).catch(()=>{});}
+});
 
 const htmlEscape = (value) => String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 const page = (title, content) => `<!doctype html>
@@ -114,13 +158,9 @@ const resultPage = (heading, message, ok=false) => page(heading, `<section class
 
 app.get('/verify',(req,res)=>res.redirect(302,'/'));
 app.get('/authorize',(req,res)=>{const state=crypto.randomBytes(32).toString('hex');states.set(state,Date.now()+300000);const q=new URLSearchParams({client_id:cfg.CLIENT_ID,redirect_uri:`${base}/callback`,response_type:'code',scope:'identify guilds',state,prompt:'consent'});res.redirect(`https://discord.com/oauth2/authorize?${q}`)});
-app.get('/callback',async(req,res)=>{const {code,state}=req.query;const expires=states.get(state);states.delete(state);if(!code||!expires||expires<Date.now())return res.status(400).type('html').send(resultPage('Verification expired', 'Please return to the homepage and try again.'));try{const body=new URLSearchParams({client_id:cfg.CLIENT_ID,client_secret:cfg.CLIENT_SECRET,grant_type:'authorization_code',code:String(code),redirect_uri:`${base}/callback`});const t=await fetch('https://discord.com/api/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!t.ok)throw Error('Token exchange failed');const token=(await t.json()).access_token;const headers={Authorization:`Bearer ${token}`};const [u,g]=await Promise.all([fetch('https://discord.com/api/users/@me',{headers}),fetch('https://discord.com/api/users/@me/guilds?limit=200',{headers})]);if(!u.ok||!g.ok)throw Error('Discord membership check failed');const user=await u.json();const guilds=await g.json();const guild=await bot.guilds.fetch(cfg.GUILD_ID);const member=await guild.members.fetch(user.id).catch(()=>null);if(!member)return res.status(403).type('html').send(resultPage('Join the server first', 'Join the No Swipe RP Discord server before verifying.'));const blockedIds=guilds.filter(x=>db.blocked.includes(String(x.id))).map(x=>x.id);
-console.log(`[Safeguard] OAuth verification for ${user.id}: ${guilds.length} guilds returned; ${db.blocked.length} blocked IDs configured; ${blockedIds.length} matches.`);
-if(blockedIds.length){
-  const kicked=await kick(member,'Membership in a blocked Discord server',blockedIds);
-  return res.status(403).type('html').send(resultPage(kicked?'Verification rejected — removed from server':'Verification rejected — removal pending',kicked?'Your account did not meet the membership requirements and has been removed from No Swipe RP.':'Your account did not meet the membership requirements. The bot could not remove you automatically. Administrators have been notified in the security logs.'));
-}await member.roles.add(cfg.VERIFIED_ROLE_ID,'Passed OAuth2 membership verification');delete db.pending[user.id];save();await logEvent({title:'Verification Successful',color:0x22c55e,member,reason:'Passed OAuth2 membership verification',outcome:'Verified role assigned'});return res.type('html').send(resultPage('Verification successful!', 'Your Discord account has been verified. You can now return to Discord.', true));}catch(e){console.error(e);return res.status(503).type('html').send(resultPage('Verification unavailable', 'Could not complete verification right now. Please try again.'));}});
+app.get('/callback',async(req,res)=>{if(!storageReady)return res.status(503).type('html').send(resultPage('Verification unavailable','Security database is not ready. Please try again shortly.'));const {code,state}=req.query;const expires=states.get(state);states.delete(state);if(!code||!expires||expires<Date.now())return res.status(400).type('html').send(resultPage('Verification expired', 'Please return to the homepage and try again.'));try{const body=new URLSearchParams({client_id:cfg.CLIENT_ID,client_secret:cfg.CLIENT_SECRET,grant_type:'authorization_code',code:String(code),redirect_uri:`${base}/callback`});const t=await fetch('https://discord.com/api/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!t.ok)throw Error('Token exchange failed');const token=(await t.json()).access_token;const headers={Authorization:`Bearer ${token}`};const [u,g]=await Promise.all([fetch('https://discord.com/api/users/@me',{headers}),fetch('https://discord.com/api/users/@me/guilds?limit=200',{headers})]);if(!u.ok||!g.ok)throw Error('Discord membership check failed');const user=await u.json();const guilds=await g.json();const guild=await bot.guilds.fetch(cfg.GUILD_ID);const member=await guild.members.fetch(user.id).catch(()=>null);if(!member)return res.status(403).type('html').send(resultPage('Join the server first', 'Join the No Swipe RP Discord server before verifying.'));const restrictions=await blockedIds();console.log(`[Safeguard] OAuth ${user.id}: ${guilds.length} guilds; ${restrictions.length} blocked IDs`);if(restrictions.length===0)throw Error('Restricted server list is empty; verification is disabled until configured');const matched=guilds.filter(x=>restrictions.includes(String(x.id))).map(x=>x.id);if(matched.length){console.log(`[Safeguard] ${user.id} matched ${matched.length} restricted servers`);const kicked=await kick(member,'Membership in a blocked Discord server',matched);return res.status(403).type('html').send(resultPage(kicked?'Verification unsuccessful — removed':'Verification rejected — removal failed',kicked?'Your account did not meet the server membership requirements and has been removed.':'Your account did not meet the server membership requirements. Administrators have been notified; removal was not completed.'));}await member.roles.add(cfg.VERIFIED_ROLE_ID,'Passed OAuth2 membership verification');await pendingRemove(user.id);await logEvent({title:'Verification Successful',color:0x22c55e,member,reason:'Passed OAuth2 membership verification',outcome:'Verified role assigned'});return res.type('html').send(resultPage('Verification successful!', 'Your Discord account has been verified. You can now return to Discord.', true));}catch(e){console.error(e);return res.status(503).type('html').send(resultPage('Verification unavailable', 'Could not complete verification right now. Please try again.'));}});
 app.listen(Number(cfg.PORT||3000),()=>console.log('Verification web server listening'));
 bot.login(cfg.DISCORD_TOKEN);
+
 
 
