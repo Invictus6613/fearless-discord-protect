@@ -36,18 +36,8 @@ const bot = new Client({intents:[GatewayIntentBits.Guilds, GatewayIntentBits.Gui
 const states = new Map();
 // Explicitly disabled until an administrator deliberately opts in.
 const kicksEnabled = cfg.KICKS_ENABLED === 'true';
-// Rate limit in memory: restart resets it, but defaults remain disabled.
-const kickAttempts = [];
-let kickCircuitOpen = false;
-function allowKickAttempt() {
-  if (!kicksEnabled || kickCircuitOpen) return false;
-  const now = Date.now();
-  while (kickAttempts.length && now - kickAttempts[0] > 60 * 60 * 1000) kickAttempts.shift();
-  // At most 3 kick attempts per rolling hour, including failures.
-  if (kickAttempts.length >= 3) { kickCircuitOpen = true; console.error('[Safeguard] KICK CIRCUIT BREAKER OPEN: maximum 3 attempts per hour reached. Restart with KICKS_ENABLED=false and investigate.'); return false; }
-  kickAttempts.push(now);
-  return true;
-}
+// No hourly kick cap. The kick() function independently enforces
+// new-join eligibility, unverified status and confirmed blocked membership.
 
 const app = express();
 let storageReady = false;
@@ -79,9 +69,9 @@ async function kick(member, reason, blockedIds=[]) {
     console.warn(`[Safeguard] Refused kick for protected member ${member.id}`);
     return false;
   }
-  if (!allowKickAttempt()) {
-    console.warn(`[Safeguard] KICK BLOCKED by safety controls for ${member.id}: ${reason}`);
-    await logEvent({title:'Removal blocked by safety controls',color:0xf59e0b,member,reason,blockedIds,outcome:'No kick attempted; manual moderator review required'});
+  if (!kicksEnabled) {
+    console.warn(`[Safeguard] KICK DISABLED by KICKS_ENABLED=false for ${member.id}: ${reason}`);
+    await logEvent({title:'Automatic kicks disabled',color:0xf59e0b,member,reason,blockedIds,outcome:'No kick attempted; manual moderator review required'});
     return false;
   }
   if (!member.kickable) {
@@ -220,6 +210,7 @@ if(!eligible || member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) {
 const kicked=await kick(member,'Membership in a blocked Discord server',matched);return res.status(403).type('html').send(resultPage(kicked?'Verification unsuccessful — removed':'Verification rejected — manual review required',kicked?'Your account did not meet the server membership requirements and has been removed.':'Your account did not meet the server membership requirements. Removal is disabled or unavailable; contact a moderator.'));}await member.roles.add(cfg.VERIFIED_ROLE_ID,'Passed OAuth2 membership verification');if(await isRecordedNewJoin(member)) await clearNewJoin(user.id);await logEvent({title:'Verification Successful',color:0x22c55e,member,reason:'Passed OAuth2 membership verification',outcome:'Verified role assigned'});return res.type('html').send(resultPage('Verification successful!', 'Your Discord account has been verified. You can now return to Discord.', true));}catch(e){console.error(e);return res.status(503).type('html').send(resultPage('Verification unavailable', 'Could not complete verification right now. Please try again.'));}});
 app.listen(Number(cfg.PORT||3000),()=>console.log('Verification web server listening'));
 bot.login(cfg.DISCORD_TOKEN);
+
 
 
 
