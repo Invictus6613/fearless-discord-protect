@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events } from 'discord.js';
+import { Client, GatewayIntentBits, PermissionFlagsBits, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, EmbedBuilder } from 'discord.js';
 
 const required = ['DISCORD_TOKEN','CLIENT_ID','CLIENT_SECRET','GUILD_ID','VERIFIED_ROLE_ID','VERIFY_CHANNEL_ID','PUBLIC_URL'];
 for (const key of required) if (!process.env[key]) throw new Error(`Missing ${key} in .env`);
@@ -18,10 +18,45 @@ const bot = new Client({intents:[GatewayIntentBits.Guilds, GatewayIntentBits.Gui
 const app = express();
 app.disable('x-powered-by');
 function button(){ return new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Verify with Discord').setStyle(ButtonStyle.Link).setURL(`${base}/verify`)); }
-async function log(message){ if (!cfg.LOG_CHANNEL_ID) return; const ch=await bot.channels.fetch(cfg.LOG_CHANNEL_ID).catch(()=>null); if(ch?.isTextBased()) await ch.send({content:message,allowedMentions:{parse:[]}}).catch(()=>{}); }
-async function kick(member, reason){ if(!member.kickable){ await log(`Could not kick ${member.user.tag}: role hierarchy or permissions`); return; } await member.kick(reason); delete db.pending[member.id]; save(); await log(`Kicked ${member.user.tag}: ${reason}`); }
+async function logEvent({title, color=0x64748b, member, reason, blockedIds=[], outcome, error}) {
+  if (!cfg.LOG_CHANNEL_ID) return;
+  const ch = await bot.channels.fetch(cfg.LOG_CHANNEL_ID).catch(e => { console.error('Log channel lookup failed:',e.message); return null; });
+  if (!ch?.isTextBased()) { console.warn('LOG_CHANNEL_ID does not point to an accessible text channel'); return; }
+  const embed = new EmbedBuilder()
+    .setTitle(title)
+    .setColor(color)
+    .setTimestamp()
+    .setFooter({text:'Fearless Safeguard • No Swipe RP'});
+  if (member) embed.addFields(
+    {name:'Member',value:`${member.user.tag}`,inline:true},
+    {name:'Discord ID',value:`${member.id}`,inline:true}
+  );
+  if (reason) embed.addFields({name:'Reason',value:String(reason).slice(0,1024)});
+  if (blockedIds.length) embed.addFields({name:'Matched restricted server IDs',value:blockedIds.join(', ').slice(0,1024)});
+  if (outcome) embed.addFields({name:'Action',value:outcome.slice(0,1024)});
+  if (error) embed.addFields({name:'Error',value:String(error).slice(0,1024)});
+  await ch.send({embeds:[embed],allowedMentions:{parse:[]}}).catch(e=>console.error('Failed to send safeguard log:',e.message));
+}
+async function log(message){ await logEvent({title:'Safeguard Notice',reason:message}); }
+async function kick(member, reason, blockedIds=[]) {
+  if (!member.kickable) {
+    await logEvent({title:'Kick Failed',color:0xf59e0b,member,reason,blockedIds,outcome:'Member was not kicked',error:'Missing Kick Members permission or bot role is too low'});
+    return false;
+  }
+  try {
+    await member.kick(reason);
+    delete db.pending[member.id];
+    save();
+    await logEvent({title:'Member Kicked',color:0xef4444,member,reason,blockedIds,outcome:'Successfully kicked'});
+    return true;
+  } catch(e) {
+    await logEvent({title:'Kick Failed',color:0xf59e0b,member,reason,blockedIds,outcome:'Member was not kicked',error:e.message});
+    console.error('Safeguard kick failed:',e);
+    return false;
+  }
+}
 async function schedule(member){ if(member.user.bot || member.roles.cache.has(cfg.VERIFIED_ROLE_ID)) return; db.pending[member.id] ??= Date.now(); save(); const ch=await bot.channels.fetch(cfg.VERIFY_CHANNEL_ID).catch(()=>null); if(ch?.isTextBased()) await ch.send({content:`<@${member.id}> Please verify within ${Math.round(timeout/60000)} minutes to remain in the server.`,components:[button()],allowedMentions:{users:[member.id]}}).catch(()=>{}); }
-async function sweep(){const guild=await bot.guilds.fetch(cfg.GUILD_ID).catch(()=>null);if(!guild)return;for(const [id,start] of Object.entries(db.pending)){if(Date.now()-start<timeout)continue;const m=await guild.members.fetch(id).catch(()=>null);if(m && !m.roles.cache.has(cfg.VERIFIED_ROLE_ID))await kick(m,'Verification timed out').catch(e=>log(`Kick error: ${e.message}`));else {delete db.pending[id];save();}}}
+async function sweep(){const guild=await bot.guilds.fetch(cfg.GUILD_ID).catch(()=>null);if(!guild)return;for(const [id,start] of Object.entries(db.pending)){if(Date.now()-start<timeout)continue;const m=await guild.members.fetch(id).catch(()=>null);if(m && !m.roles.cache.has(cfg.VERIFIED_ROLE_ID))await kick(m,'Verification timed out');else {delete db.pending[id];save();}}}
 const commands=[new SlashCommandBuilder().setName('blockserver').setDescription('Manage blocked Discord server IDs').setDefaultMemberPermissions(PermissionFlagsBits.Administrator).addSubcommand(s=>s.setName('add').setDescription('Block a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('remove').setDescription('Unblock a server').addStringOption(o=>o.setName('id').setDescription('Discord server ID').setRequired(true))).addSubcommand(s=>s.setName('list').setDescription('List blocked IDs')),new SlashCommandBuilder().setName('verifypanel').setDescription('Post verification button').setDefaultMemberPermissions(PermissionFlagsBits.Administrator)];
 bot.once(Events.ClientReady,async()=>{await bot.application.commands.set(commands.map(c=>c.toJSON()),cfg.GUILD_ID); console.log(`Logged in as ${bot.user.tag}`);const guild=await bot.guilds.fetch(cfg.GUILD_ID);await guild.members.fetch();for(const member of guild.members.cache.values())if(!member.user.bot&&!member.roles.cache.has(cfg.VERIFIED_ROLE_ID)&&!db.pending[member.id])db.pending[member.id]=Date.now();save();setInterval(()=>sweep().catch(console.error),30000);});
 bot.on(Events.GuildMemberAdd,member=>{if(member.guild.id===cfg.GUILD_ID)schedule(member).catch(console.error)});
@@ -71,6 +106,7 @@ app.get('/terms', (req,res) => res.type('html').send(page('Terms of Service', `
 const resultPage = (heading, message, ok=false) => page(heading, `<section class="hero panel"><div class="eyebrow">${ok?'Verification complete':'Verification notice'}</div><h1>${htmlEscape(heading)}</h1><p class="lead">${htmlEscape(message)}</p><a class="button" href="/">Return to homepage</a></section>`);
 
 app.get('/verify',(req,res)=>{const state=crypto.randomBytes(32).toString('hex');states.set(state,Date.now()+300000);const q=new URLSearchParams({client_id:cfg.CLIENT_ID,redirect_uri:`${base}/callback`,response_type:'code',scope:'identify guilds',state,prompt:'consent'});res.redirect(`https://discord.com/oauth2/authorize?${q}`)});
-app.get('/callback',async(req,res)=>{const {code,state}=req.query;const expires=states.get(state);states.delete(state);if(!code||!expires||expires<Date.now())return res.status(400).type('html').send(resultPage('Verification expired', 'Please return to the homepage and try again.'));try{const body=new URLSearchParams({client_id:cfg.CLIENT_ID,client_secret:cfg.CLIENT_SECRET,grant_type:'authorization_code',code:String(code),redirect_uri:`${base}/callback`});const t=await fetch('https://discord.com/api/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!t.ok)throw Error('Token exchange failed');const token=(await t.json()).access_token;const headers={Authorization:`Bearer ${token}`};const [u,g]=await Promise.all([fetch('https://discord.com/api/users/@me',{headers}),fetch('https://discord.com/api/users/@me/guilds?limit=200',{headers})]);if(!u.ok||!g.ok)throw Error('Discord membership check failed');const user=await u.json();const guilds=await g.json();const guild=await bot.guilds.fetch(cfg.GUILD_ID);const member=await guild.members.fetch(user.id).catch(()=>null);if(!member)return res.status(403).type('html').send(resultPage('Join the server first', 'Join the No Swipe RP Discord server before verifying.'));if(guilds.some(x=>db.blocked.includes(x.id))){await kick(member,'Membership in a blocked Discord server');return res.status(403).type('html').send(resultPage('Verification unsuccessful', 'Your account did not meet the server membership requirements. Contact No Swipe RP administration for assistance.'));}await member.roles.add(cfg.VERIFIED_ROLE_ID,'Passed OAuth2 membership verification');delete db.pending[user.id];save();await log(`Verified ${user.username} (${user.id})`);return res.type('html').send(resultPage('Verification successful!', 'Your Discord account has been verified. You can now return to Discord.', true));}catch(e){console.error(e);return res.status(503).type('html').send(resultPage('Verification unavailable', 'Could not complete verification right now. Please try again.'));}});
+app.get('/callback',async(req,res)=>{const {code,state}=req.query;const expires=states.get(state);states.delete(state);if(!code||!expires||expires<Date.now())return res.status(400).type('html').send(resultPage('Verification expired', 'Please return to the homepage and try again.'));try{const body=new URLSearchParams({client_id:cfg.CLIENT_ID,client_secret:cfg.CLIENT_SECRET,grant_type:'authorization_code',code:String(code),redirect_uri:`${base}/callback`});const t=await fetch('https://discord.com/api/oauth2/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(!t.ok)throw Error('Token exchange failed');const token=(await t.json()).access_token;const headers={Authorization:`Bearer ${token}`};const [u,g]=await Promise.all([fetch('https://discord.com/api/users/@me',{headers}),fetch('https://discord.com/api/users/@me/guilds?limit=200',{headers})]);if(!u.ok||!g.ok)throw Error('Discord membership check failed');const user=await u.json();const guilds=await g.json();const guild=await bot.guilds.fetch(cfg.GUILD_ID);const member=await guild.members.fetch(user.id).catch(()=>null);if(!member)return res.status(403).type('html').send(resultPage('Join the server first', 'Join the No Swipe RP Discord server before verifying.'));const blockedIds=guilds.filter(x=>db.blocked.includes(x.id)).map(x=>x.id);if(blockedIds.length){await kick(member,'Membership in a blocked Discord server',blockedIds);return res.status(403).type('html').send(resultPage('Verification unsuccessful', 'Your account did not meet the server membership requirements. Contact No Swipe RP administration for assistance.'));}await member.roles.add(cfg.VERIFIED_ROLE_ID,'Passed OAuth2 membership verification');delete db.pending[user.id];save();await logEvent({title:'Verification Successful',color:0x22c55e,member,reason:'Passed OAuth2 membership verification',outcome:'Verified role assigned'});return res.type('html').send(resultPage('Verification successful!', 'Your Discord account has been verified. You can now return to Discord.', true));}catch(e){console.error(e);return res.status(503).type('html').send(resultPage('Verification unavailable', 'Could not complete verification right now. Please try again.'));}});
 app.listen(Number(cfg.PORT||3000),()=>console.log('Verification web server listening'));
 bot.login(cfg.DISCORD_TOKEN);
+
